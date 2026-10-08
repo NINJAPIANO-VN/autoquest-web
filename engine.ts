@@ -33,32 +33,21 @@ export interface QuestTask {
 }
 
 export enum TaskType {
-    // Video & Media
     WATCH_VIDEO = 'WATCH_VIDEO',
     WATCH_VIDEO_ON_MOBILE = 'WATCH_VIDEO_ON_MOBILE',
     WATCH_STREAM = 'WATCH_STREAM',
-    
-    // Gaming - Desktop/PC
     PLAY_ON_DESKTOP = 'PLAY_ON_DESKTOP',
     STREAM_ON_DESKTOP = 'STREAM_ON_DESKTOP',
-    
-    // Gaming - Console
     PLAY_ON_XBOX = 'PLAY_ON_XBOX',
     PLAY_ON_PLAYSTATION = 'PLAY_ON_PLAYSTATION',
     PLAY_ON_NINTENDO = 'PLAY_ON_NINTENDO',
-    
-    // Gaming - Mobile/Social
     PLAY_ON_MOBILE = 'PLAY_ON_MOBILE',
     PLAY_ACTIVITY = 'PLAY_ACTIVITY',
     PLAY_SOCIAL_GAME = 'PLAY_SOCIAL_GAME',
-    
-    // Engagement
     JOIN_COMMUNITY = 'JOIN_COMMUNITY',
     SHARE_CONTENT = 'SHARE_CONTENT',
     FOLLOW_SOCIAL = 'FOLLOW_SOCIAL',
     COMPLETE_SURVEY = 'COMPLETE_SURVEY',
-    
-    // Purchase/Monetization
     MAKE_PURCHASE = 'MAKE_PURCHASE',
     REDEEM_CODE = 'REDEEM_CODE',
 }
@@ -71,7 +60,6 @@ export interface QuestTaskConfig {
     developer_application_id?: Snowflake;
 }
 
-// v2 format returned by current API
 export interface QuestTaskConfigV2 {
     join_operator: string;
     tasks: Record<TaskType, QuestTask & { type: string; applications?: { id: string }[] }>;
@@ -232,7 +220,6 @@ export class Quest {
     detectTaskType(): TaskType | null {
         const tasks = this.getTasks();
         if (!tasks) return null;
-        // Priority: Gameplay > Streaming > Video > Social > Other
         const priority = [
             TaskType.PLAY_ON_DESKTOP,
             TaskType.PLAY_ON_XBOX,
@@ -287,7 +274,11 @@ async function patchedFetch(url: string, init: RequestInit): Promise<ResponseLik
     if (init.headers) {
         const h = new Headers(init.headers as any);
         if (h.has('User-Agent')) h.set('User-Agent', USER_AGENT);
-        if (h.has('Authorization')) h.set('Authorization', h.get('Authorization')!.replace('Bot ', ''));
+        if (h.has('Authorization')) {
+            let token = h.get('Authorization') || '';
+            token = token.replace(/^Bot\s+/i, '').trim(); // Làm sạch token, bỏ tiền tố Bot tránh lỗi 401[cite: 4]
+            h.set('Authorization', token);
+        }
         h.append('accept-language', 'vi');
         h.append('origin', 'https://discord.com');
         h.append('pragma', 'no-cache');
@@ -305,7 +296,25 @@ async function patchedFetch(url: string, init: RequestInit): Promise<ResponseLik
         h.append('x-super-properties', Buffer.from(JSON.stringify(CLIENT_PROPS)).toString('base64'));
         init.headers = h;
     }
-    return DefaultRestOptions.makeRequest(url, init);
+
+    let res = await DefaultRestOptions.makeRequest(url, init);
+
+    // Tự động chờ khi bị dính Rate Limit (429)
+    if (res.statusCode === 429) {
+        try {
+            const bodyText = await res.body.text();
+            const data = JSON.parse(bodyText);
+            const retryAfter = (data.retry_after || 5) * 1000;
+            console.log(`[Rate Limited] Chờ ${data.retry_after || 5} giây trước khi thử lại...`);
+            await new Promise((r) => setTimeout(r, retryAfter));
+            return DefaultRestOptions.makeRequest(url, init);
+        } catch {
+            await new Promise((r) => setTimeout(r, 5000));
+            return DefaultRestOptions.makeRequest(url, init);
+        }
+    }
+
+    return res;
 }
 
 const origSend = WebSocketShard.prototype.send;
@@ -384,24 +393,37 @@ export class QuestStore implements Iterable<Quest> {
     }
 
     async enroll(questId: string) {
-        const res = await this.engine.rest.post(`/quests/${questId}/enroll`, {
-            body: { location: 11, is_targeted: false, metadata_raw: null },
-        });
-        this.find(questId)?.refreshStatus(res as any);
+        try {
+            const res = await this.engine.rest.post(`/quests/${questId}/enroll`, {
+                body: { location: 11, is_targeted: false, metadata_raw: null },
+            });
+            this.find(questId)?.refreshStatus(res as any);
+        } catch (e: any) {
+            if (e?.message?.includes('Unauthorized')) {
+                console.log(`[Lỗi] Token không hợp lệ (Unauthorized) khi đăng ký quest.`);
+            }
+        }
     }
 
     async grabReward(questId: string) {
         try {
+            const quest = this.find(questId);
+            if (!quest || quest.isClaimed()) return null; // Tránh gọi claim lặp lại nếu đã nhận rồi[cite: 4]
             const r = await this.engine.claimReward(questId);
             return r;
-        } catch {
+        } catch (e: any) {
+            if (e?.message?.includes('Unauthorized')) {
+                console.log(`[Lỗi] Token không hợp lệ khi nhận thưởng.`);
+            }
             return null;
         }
     }
 
     async grabAllRewards() {
         for (const q of this.claimable()) {
+            if (q.isClaimed()) continue;
             await this.grabReward(q.id);
+            await this.sleep(3000); // Thêm độ trễ giữa các phần thưởng chống spam
         }
     }
 
@@ -410,208 +432,38 @@ export class QuestStore implements Iterable<Quest> {
     }
 
     async execute(quest: Quest) {
-        const label = quest.name;
+        if (quest.isCompleted() && quest.isClaimed()) return;
+
         const taskType = quest.detectTaskType();
         if (!taskType) return;
 
-        if (!quest.isEnrolled()) {
-            await this.enroll(quest.id);
-        }
-
-        const target = quest.getTarget();
-        let done = quest.getProgress();
-
-        // Video watching tasks
-        if (taskType === TaskType.WATCH_VIDEO || taskType === TaskType.WATCH_VIDEO_ON_MOBILE) {
-            await this.executeVideoWatch(quest, taskType, target, done);
-        }
-        // Desktop gameplay and streaming
-        else if (taskType === TaskType.PLAY_ON_DESKTOP || taskType === TaskType.STREAM_ON_DESKTOP) {
-            await this.executeDesktopGameplay(quest, taskType);
-        }
-        // Console gameplay
-        else if (taskType === TaskType.PLAY_ON_XBOX || taskType === TaskType.PLAY_ON_PLAYSTATION || taskType === TaskType.PLAY_ON_NINTENDO) {
-            await this.executeConsoleGameplay(quest, taskType);
-        }
-        // Mobile/Social games
-        else if (taskType === TaskType.PLAY_ON_MOBILE || taskType === TaskType.PLAY_SOCIAL_GAME || taskType === TaskType.PLAY_ACTIVITY) {
-            await this.executeMobileGameplay(quest, taskType);
-        }
-        // Stream watching
-        else if (taskType === TaskType.WATCH_STREAM) {
-            await this.executeStreamWatch(quest);
-        }
-        // Social engagement
-        else if (taskType === TaskType.FOLLOW_SOCIAL) {
-            await this.executeSocialFollow(quest);
-        }
-        else if (taskType === TaskType.SHARE_CONTENT) {
-            await this.executeShareContent(quest);
-        }
-        else if (taskType === TaskType.JOIN_COMMUNITY) {
-            await this.executeJoinCommunity(quest);
-        }
-        // Other tasks - attempt generic progress tracking
-        else if (taskType === TaskType.COMPLETE_SURVEY || taskType === TaskType.REDEEM_CODE || taskType === TaskType.MAKE_PURCHASE) {
-            await this.executeGenericProgress(quest);
-        }
-
-        await this.grabReward(quest.id);
-    }
-
-    private async executeVideoWatch(quest: Quest, taskType: TaskType, target: number, done: number) {
-        const enrolledAt = new Date(quest.userStatus?.enrolled_at as any).getTime();
-        let finished = false;
-
-        while (true) {
-            const maxAllowed = Math.floor((Date.now() - enrolledAt) / 1000) + 10;
-            const diff = maxAllowed - done;
-            const next = done + 7;
-
-            if (diff >= 7) {
-                const res = (await this.engine.rest.post(`/quests/${quest.id}/video-progress`, {
-                    body: { timestamp: Math.min(target, next + Math.random()) },
-                })) as any;
-                finished = res.completed_at != null;
-                done = Math.min(target, next);
+        try {
+            if (!quest.isEnrolled()) {
+                await this.enroll(quest.id);
+                await this.sleep(2000);
             }
 
-            if (next >= target) break;
-            await this.sleep(1000);
-        }
+            const target = quest.getTarget();
+            let done = quest.getProgress();
 
-        if (!finished) {
-            await this.engine.rest.post(`/quests/${quest.id}/video-progress`, {
-                body: { timestamp: target },
-            });
-        }
-    }
-
-    private async executeDesktopGameplay(quest: Quest, taskType: TaskType) {
-        const tasks = quest.config.task_config_v2?.tasks ?? quest.config.task_config?.tasks;
-        const taskDef = tasks?.[taskType] as any;
-        const appId = taskDef?.applications?.[0]?.id ?? quest.config.application.id;
-        
-        while (!quest.isCompleted()) {
-            const res = await this.engine.rest.post(`/quests/${quest.id}/heartbeat`, {
-                body: { application_id: appId, terminal: false },
-            });
-            quest.refreshStatus(res as any);
-            await this.sleep(60_000);
-        }
-        
-        const res = await this.engine.rest.post(`/quests/${quest.id}/heartbeat`, {
-            body: { application_id: appId, terminal: true },
-        });
-        quest.refreshStatus(res as any);
-    }
-
-    private async executeConsoleGameplay(quest: Quest, taskType: TaskType) {
-        // Console gameplay detection - checks for heartbeats or play sessions
-        const tasks = quest.config.task_config_v2?.tasks ?? quest.config.task_config?.tasks;
-        const taskDef = tasks?.[taskType] as any;
-        const appId = taskDef?.applications?.[0]?.id ?? quest.config.application.id;
-        
-        while (!quest.isCompleted()) {
-            const res = await this.engine.rest.post(`/quests/${quest.id}/console-heartbeat`, {
-                body: { application_id: appId, platform: taskType.replace('PLAY_ON_', ''), terminal: false },
-            }).catch(() => null);
-            
-            if (res) {
-                quest.refreshStatus(res as any);
+            if (taskType === TaskType.WATCH_VIDEO || taskType === TaskType.WATCH_VIDEO_ON_MOBILE) {
+                await this.executeVideoWatch(quest, taskType, target, done);
+            } else if (taskType === TaskType.PLAY_ON_DESKTOP || taskType === TaskType.STREAM_ON_DESKTOP) {
+                await this.executeDesktopGameplay(quest, taskType);
+            } else if (taskType === TaskType.PLAY_ON_XBOX || taskType === TaskType.PLAY_ON_PLAYSTATION || taskType === TaskType.PLAY_ON_NINTENDO) {
+                await this.executeConsoleGameplay(quest, taskType);
+            } else if (taskType === TaskType.PLAY_ON_MOBILE || taskType === TaskType.PLAY_SOCIAL_GAME || taskType === TaskType.PLAY_ACTIVITY) {
+                await this.executeMobileGameplay(quest, taskType);
+            } else if (taskType === TaskType.WATCH_STREAM) {
+                await this.executeStreamWatch(quest);
+            } else {
+                await this.executeGenericProgress(quest);
             }
-            await this.sleep(60_000);
-        }
-        
-        await this.engine.rest.post(`/quests/${quest.id}/console-heartbeat`, {
-            body: { application_id: appId, platform: taskType.replace('PLAY_ON_', ''), terminal: true },
-        }).catch(() => null);
-    }
 
-    private async executeStreamWatch(quest: Quest) {
-        // Stream watching - similar to video but tracks stream heartbeat
-        const enrolledAt = new Date(quest.userStatus?.enrolled_at as any).getTime();
-        const target = quest.getTarget();
-        let done = quest.getProgress();
-
-        while (done < target) {
-            const elapsed = Math.floor((Date.now() - enrolledAt) / 1000);
-            const next = Math.min(done + 30, target);
-
-            const res = (await this.engine.rest.post(`/quests/${quest.id}/stream-progress`, {
-                body: { timestamp: next, elapsed },
-            })) as any;
-
-            done = Math.min(target, next);
-            if (res.completed_at) break;
-            await this.sleep(30_000);
-        }
-    }
-
-    private async executeMobileGameplay(quest: Quest, taskType: TaskType) {
-        // Mobile/social game progress tracking
-        const tasks = quest.config.task_config_v2?.tasks ?? quest.config.task_config?.tasks;
-        const taskDef = tasks?.[taskType] as any;
-        const appId = taskDef?.applications?.[0]?.id ?? quest.config.application.id;
-
-        while (!quest.isCompleted()) {
-            const res = await this.engine.rest.post(`/quests/${quest.id}/mobile-heartbeat`, {
-                body: { application_id: appId, session_id: randomUUID() },
-            }).catch(() => null);
-
-            if (res) {
-                quest.refreshStatus(res as any);
+            await this.sleep(2000);
+            if (!quest.isClaimed()) {
+                await this.grabReward(quest.id);
             }
-            await this.sleep(45_000);
-        }
-    }
-
-    private async executeSocialFollow(quest: Quest) {
-        // Social follow - one-time completion
-        const res = await this.engine.rest.post(`/quests/${quest.id}/social-action`, {
-            body: { action: 'follow', platform: 'social' },
-        }).catch(() => null);
-
-        if (res) {
-            quest.refreshStatus(res as any);
-        }
-    }
-
-    private async executeShareContent(quest: Quest) {
-        // Share content - one-time action
-        const res = await this.engine.rest.post(`/quests/${quest.id}/social-action`, {
-            body: { action: 'share', platform: 'social' },
-        }).catch(() => null);
-
-        if (res) {
-            quest.refreshStatus(res as any);
-        }
-    }
-
-    private async executeJoinCommunity(quest: Quest) {
-        // Join community - one-time action
-        const res = await this.engine.rest.post(`/quests/${quest.id}/social-action`, {
-            body: { action: 'join', platform: 'community' },
-        }).catch(() => null);
-
-        if (res) {
-            quest.refreshStatus(res as any);
-        }
-    }
-
-    private async executeGenericProgress(quest: Quest) {
-        // Generic progress for surveys, codes, purchases - poll until complete
-        let attempts = 0;
-        const maxAttempts = 100;
-
-        while (!quest.isCompleted() && attempts < maxAttempts) {
-            const res = await this.engine.rest.get(`/quests/${quest.id}/progress`).catch(() => null);
-            
-            if (res) {
-                quest.refreshStatus(res as any);
-            }
-            attempts++;
-            await this.sleep(10_000);
-        }
-    }
-}
+        } catch (e: any) {
+            if (e?.message?.includes('Unauthorized')) {
+                console.log(`[Lỗi Token] Tài khoản bị từ chối xác thực (Unauthorized). Vui lòng cập nhật token mới
