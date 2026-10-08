@@ -7,8 +7,6 @@ import { randomUUID } from 'node:crypto';
 
 export type Snowflake = string;
 
-// ... (Giữ nguyên các interface QuestApplication, QuestGradient, QuestMessages, QuestTask, v.v. từ nguồn[cite: 3])
-
 export enum TaskType {
     WATCH_VIDEO = 'WATCH_VIDEO',
     WATCH_VIDEO_ON_MOBILE = 'WATCH_VIDEO_ON_MOBILE',
@@ -100,15 +98,14 @@ const CLIENT_PROPS = {
     client_heartbeat_session_id: randomUUID(), client_app_state: 'focused',
 };
 
-// Sửa lỗi Unauthorized và thêm cơ chế tự xử lý Rate Limit (429)
+// Xử lý request chuẩn, tự động lọc bỏ tiền tố Bot và xử lý Rate Limit (429)
 async function patchedFetch(url: string, init: RequestInit): Promise<ResponseLike> {
     if (init.headers) {
         const h = new Headers(init.headers as any);
         if (h.has('User-Agent')) h.set('User-Agent', USER_AGENT);
         if (h.has('Authorization')) {
             let token = h.get('Authorization') || '';
-            // Loại bỏ tiền tố Bot nếu lỡ truyền vào nhằm tránh lỗi 401 Unauthorized[cite: 3]
-            token = token.replace(/^Bot\s+/i, '').trim();
+            token = token.replace(/^Bot\s+/i, '').trim(); // Tránh lỗi 401 Unauthorized do dính chữ Bot
             h.set('Authorization', token);
         }
         h.append('accept-language', 'vi');
@@ -119,7 +116,7 @@ async function patchedFetch(url: string, init: RequestInit): Promise<ResponseLik
 
     let res = await DefaultRestOptions.makeRequest(url, init);
 
-    // Xử lý tự động khi bị dính Rate Limit (429)
+    // Tự động chờ và retry khi bị Discord giới hạn tốc độ (Rate Limit 429)
     if (res.statusCode === 429) {
         try {
             const bodyText = await res.body.text();
@@ -127,7 +124,6 @@ async function patchedFetch(url: string, init: RequestInit): Promise<ResponseLik
             const retryAfter = (data.retry_after || 5) * 1000;
             console.log(`[Rate Limited] Đang bị chặn, tự động chờ ${data.retry_after} giây...`);
             await new Promise((r) => setTimeout(r, retryAfter));
-            // Gửi lại request sau khi chờ xong
             return DefaultRestOptions.makeRequest(url, init);
         } catch {
             await new Promise((r) => setTimeout(r, 5000));
@@ -168,7 +164,7 @@ export class HieuTool extends Client {
     }
 
     async claimReward(questId: string): Promise<any> {
-        // Sửa lỗi Invalid Form Body bằng cách truyền body rỗng đúng chuẩn JSON[cite: 3]
+        // Truyền body rỗng đúng chuẩn chống lỗi Invalid Form Body
         return this.rest.post(`/quests/${questId}/claim-reward`, { body: {} });
     }
 }
@@ -210,7 +206,7 @@ export class QuestStore {
     async grabAllRewards() {
         for (const q of this.claimable()) {
             await this.grabReward(q.id);
-            await new Promise((r) => setTimeout(r, 3000)); // Thêm delay giữa các lần nhận thưởng để tránh rate limit[cite: 3]
+            await new Promise((r) => setTimeout(r, 3000)); // Delay giữa các lần nhận thưởng chống spam
         }
     }
 
@@ -228,6 +224,7 @@ export class QuestStore {
         const target = quest.getTarget();
         let done = quest.getProgress();
 
+        // Xử lý xem video an toàn (WATCH_VIDEO & WATCH_VIDEO_ON_MOBILE)
         if (taskType === TaskType.WATCH_VIDEO || taskType === TaskType.WATCH_VIDEO_ON_MOBILE) {
             const enrolledAt = new Date(quest.userStatus?.enrolled_at as any).getTime();
             while (done < target) {
@@ -239,11 +236,17 @@ export class QuestStore {
                     quest.refreshStatus(res);
                     done = next;
                 } catch (e: any) {
+                    if (e.message?.includes('Unauthorized')) {
+                        console.log('[Lỗi] Token không hợp lệ!');
+                        break;
+                    }
                     break;
                 }
-                await this.sleep(2000); // Thêm độ trễ chống spam
+                await this.sleep(3000); // Giãn cách 3 giây giữa các nhịp gửi tiến trình video
             }
-        } else if (taskType === TaskType.PLAY_ON_DESKTOP || taskType === TaskType.STREAM_ON_DESKTOP) {
+        } 
+        // Xử lý giả lập chơi game / streaming (PLAY_ON_DESKTOP & STREAM_ON_DESKTOP)
+        else if (taskType === TaskType.PLAY_ON_DESKTOP || taskType === TaskType.STREAM_ON_DESKTOP) {
             const tasks = quest.config.task_config_v2?.tasks ?? quest.config.task_config?.tasks;
             const taskDef = tasks?.[taskType] as any;
             const appId = taskDef?.applications?.[0]?.id ?? quest.config.application.id;
@@ -254,11 +257,19 @@ export class QuestStore {
                         body: { application_id: appId, terminal: false },
                     });
                     quest.refreshStatus(res as any);
-                } catch {
-                    // Bỏ qua lỗi nhỏ để vòng lặp heartbeat tiếp tục ổn định
+                } catch (e: any) {
+                    if (e.message?.includes('Unauthorized')) {
+                        break;
+                    }
                 }
-                await this.sleep(60_000); // 1 phút gửi 1 nhịp heartbeat theo chuẩn Discord
+                await this.sleep(60_000); // Gửi nhịp heartbeat đều đặn mỗi 60 giây theo chuẩn Discord
             }
+            
+            try {
+                await this.engine.rest.post(`/quests/${quest.id}/heartbeat`, {
+                    body: { application_id: appId, terminal: true },
+                });
+            } catch {}
         }
 
         await this.sleep(2000);
