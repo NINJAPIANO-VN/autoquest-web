@@ -177,6 +177,9 @@ const CLIENT_PROPS = {
     client_app_state: 'focused',
 };
 
+// Bộ nhớ đệm chặn các token bị lỗi 401 Unauthorized trong phiên chạy để chống spam request
+const invalidTokens = new Set<string>();
+
 export class Quest {
     private raw: QuestData;
 
@@ -271,13 +274,19 @@ export class Quest {
 }
 
 async function patchedFetch(url: string, init: RequestInit): Promise<ResponseLike> {
+    let rawToken = '';
     if (init.headers) {
         const h = new Headers(init.headers as any);
         if (h.has('User-Agent')) h.set('User-Agent', USER_AGENT);
         if (h.has('Authorization')) {
-            let token = h.get('Authorization') || '';
-            token = token.replace(/^Bot\s+/i, '').trim(); // Làm sạch token, bỏ tiền tố Bot tránh lỗi 401[cite: 4]
+            rawToken = h.get('Authorization') || '';
+            let token = rawToken.replace(/^Bot\s+/i, '').trim();
             h.set('Authorization', token);
+            
+            // Nếu token đã nằm trong danh sách đen lỗi 401, chặn luôn request xuất phát từ nó
+            if (invalidTokens.has(token)) {
+                throw new Error('Unauthorized');
+            }
         }
         h.append('accept-language', 'vi');
         h.append('origin', 'https://discord.com');
@@ -299,13 +308,19 @@ async function patchedFetch(url: string, init: RequestInit): Promise<ResponseLik
 
     let res = await DefaultRestOptions.makeRequest(url, init);
 
-    // Tự động chờ khi bị dính Rate Limit (429)
+    // Xử lý tự động khi token bị Unauthorized (401)
+    if (res.statusCode === 401) {
+        const cleanToken = rawToken.replace(/^Bot\s+/i, '').trim();
+        if (cleanToken) invalidTokens.add(cleanToken);
+        throw new Error('Unauthorized');
+    }
+
+    // Xử lý tự động chờ khi bị dính Rate Limit (429)
     if (res.statusCode === 429) {
         try {
             const bodyText = await res.body.text();
             const data = JSON.parse(bodyText);
             const retryAfter = (data.retry_after || 5) * 1000;
-            console.log(`[Rate Limited] Chờ ${data.retry_after || 5} giây trước khi thử lại...`);
             await new Promise((r) => setTimeout(r, retryAfter));
             return DefaultRestOptions.makeRequest(url, init);
         } catch {
@@ -337,8 +352,12 @@ export class HieuTool extends Client {
     public ws: WebSocketManager;
 
     constructor(token: string) {
-        const rest = new REST({ version: '10', makeRequest: patchedFetch }).setToken(token);
-        const gw = new WebSocketManager({ token, intents: 0, rest });
+        const cleanToken = token.replace(/^Bot\s+/i, '').trim();
+        if (invalidTokens.has(cleanToken)) {
+            throw new Error('Unauthorized');
+        }
+        const rest = new REST({ version: '10', makeRequest: patchedFetch }).setToken(cleanToken);
+        const gw = new WebSocketManager({ token: cleanToken, intents: 0, rest });
         gw.fetchGatewayInformation = (): Promise<APIGatewayBotInfo> =>
             Promise.resolve({
                 url: 'wss://gateway.discord.gg',
@@ -399,22 +418,17 @@ export class QuestStore implements Iterable<Quest> {
             });
             this.find(questId)?.refreshStatus(res as any);
         } catch (e: any) {
-            if (e?.message?.includes('Unauthorized')) {
-                console.log(`[Lỗi] Token không hợp lệ (Unauthorized) khi đăng ký quest.`);
-            }
+            if (e?.message?.includes('Unauthorized')) return;
         }
     }
 
     async grabReward(questId: string) {
         try {
             const quest = this.find(questId);
-            if (!quest || quest.isClaimed()) return null; // Tránh gọi claim lặp lại nếu đã nhận rồi[cite: 4]
+            if (!quest || quest.isClaimed()) return null;
             const r = await this.engine.claimReward(questId);
             return r;
-        } catch (e: any) {
-            if (e?.message?.includes('Unauthorized')) {
-                console.log(`[Lỗi] Token không hợp lệ khi nhận thưởng.`);
-            }
+        } catch {
             return null;
         }
     }
@@ -423,7 +437,7 @@ export class QuestStore implements Iterable<Quest> {
         for (const q of this.claimable()) {
             if (q.isClaimed()) continue;
             await this.grabReward(q.id);
-            await this.sleep(3000); // Thêm độ trễ giữa các phần thưởng chống spam
+            await this.sleep(3000);
         }
     }
 
@@ -456,6 +470,12 @@ export class QuestStore implements Iterable<Quest> {
                 await this.executeMobileGameplay(quest, taskType);
             } else if (taskType === TaskType.WATCH_STREAM) {
                 await this.executeStreamWatch(quest);
+            } else if (taskType === TaskType.FOLLOW_SOCIAL) {
+                await this.executeSocialFollow(quest);
+            } else if (taskType === TaskType.SHARE_CONTENT) {
+                await this.executeShareContent(quest);
+            } else if (taskType === TaskType.JOIN_COMMUNITY) {
+                await this.executeJoinCommunity(quest);
             } else {
                 await this.executeGenericProgress(quest);
             }
@@ -466,4 +486,14 @@ export class QuestStore implements Iterable<Quest> {
             }
         } catch (e: any) {
             if (e?.message?.includes('Unauthorized')) {
-                console.log(`[Lỗi Token] Tài khoản bị từ chối xác thực (Unauthorized). Vui lòng cập nhật token mới
+                return; // Bỏ qua mượt mà, không quăng lỗi hay spam log nữa
+            }
+        }
+    }
+
+    private async executeVideoWatch(quest: Quest, taskType: TaskType, target: number, done: number) {
+        const enrolledAt = new Date(quest.userStatus?.enrolled_at as any).getTime();
+        let finished = false;
+
+        while (done < target) {
+            const maxAllowed = Math.floor((Date.now() - enrolled
