@@ -496,4 +496,168 @@ export class QuestStore implements Iterable<Quest> {
         let finished = false;
 
         while (done < target) {
-            const maxAllowed = Math.floor((Date.now() - enrolled
+            const maxAllowed = Math.floor((Date.now() - enrolledAt) / 1000) + 10;
+            const diff = maxAllowed - done;
+            const next = Math.min(target, done + 7);
+
+            if (diff >= 7) {
+                try {
+                    const res = (await this.engine.rest.post(`/quests/${quest.id}/video-progress`, {
+                        body: { timestamp: next + Math.random() },
+                    })) as any;
+                    finished = res.completed_at != null;
+                    done = next;
+                    if (finished) break;
+                } catch (e: any) {
+                    if (e?.message?.includes('Unauthorized')) break;
+                    break;
+                }
+            }
+
+            if (next >= target) break;
+            await this.sleep(1000);
+        }
+
+        if (!finished) {
+            try {
+                await this.engine.rest.post(`/quests/${quest.id}/video-progress`, {
+                    body: { timestamp: target },
+                });
+            } catch {}
+        }
+    }
+
+    private async executeDesktopGameplay(quest: Quest, taskType: TaskType) {
+        const tasks = quest.config.task_config_v2?.tasks ?? quest.config.task_config?.tasks;
+        const taskDef = tasks?.[taskType] as any;
+        const appId = taskDef?.applications?.[0]?.id ?? quest.config.application.id;
+        
+        let attempts = 0;
+        while (!quest.isCompleted() && attempts < 120) {
+            try {
+                const res = await this.engine.rest.post(`/quests/${quest.id}/heartbeat`, {
+                    body: { application_id: appId, terminal: false },
+                });
+                quest.refreshStatus(res as any);
+            } catch (e: any) {
+                if (e?.message?.includes('Unauthorized')) break;
+            }
+            attempts++;
+            await this.sleep(60_000);
+        }
+        
+        try {
+            await this.engine.rest.post(`/quests/${quest.id}/heartbeat`, {
+                body: { application_id: appId, terminal: true },
+            });
+        } catch {}
+    }
+
+    private async executeConsoleGameplay(quest: Quest, taskType: TaskType) {
+        const tasks = quest.config.task_config_v2?.tasks ?? quest.config.task_config?.tasks;
+        const taskDef = tasks?.[taskType] as any;
+        const appId = taskDef?.applications?.[0]?.id ?? quest.config.application.id;
+        
+        let attempts = 0;
+        while (!quest.isCompleted() && attempts < 120) {
+            const res = await this.engine.rest.post(`/quests/${quest.id}/console-heartbeat`, {
+                body: { application_id: appId, platform: taskType.replace('PLAY_ON_', ''), terminal: false },
+            }).catch(() => null);
+            
+            if (res) {
+                quest.refreshStatus(res as any);
+            }
+            attempts++;
+            await this.sleep(60_000);
+        }
+        
+        await this.engine.rest.post(`/quests/${quest.id}/console-heartbeat`, {
+            body: { application_id: appId, platform: taskType.replace('PLAY_ON_', ''), terminal: true },
+        }).catch(() => null);
+    }
+
+    private async executeStreamWatch(quest: Quest) {
+        const enrolledAt = new Date(quest.userStatus?.enrolled_at as any).getTime();
+        const target = quest.getTarget();
+        let done = quest.getProgress();
+
+        while (done < target) {
+            const elapsed = Math.floor((Date.now() - enrolledAt) / 1000);
+            const next = Math.min(done + 30, target);
+
+            const res = (await this.engine.rest.post(`/quests/${quest.id}/stream-progress`, {
+                body: { timestamp: next, elapsed },
+            })).catch(() => null) as any;
+
+            if (res) {
+                done = Math.min(target, next);
+                if (res.completed_at) break;
+            }
+            await this.sleep(30_000);
+        }
+    }
+
+    private async executeMobileGameplay(quest: Quest, taskType: TaskType) {
+        const tasks = quest.config.task_config_v2?.tasks ?? quest.config.task_config?.tasks;
+        const taskDef = tasks?.[taskType] as any;
+        const appId = taskDef?.applications?.[0]?.id ?? quest.config.application.id;
+
+        let attempts = 0;
+        while (!quest.isCompleted() && attempts < 120) {
+            const res = await this.engine.rest.post(`/quests/${quest.id}/mobile-heartbeat`, {
+                body: { application_id: appId, session_id: randomUUID() },
+            }).catch(() => null);
+
+            if (res) {
+                quest.refreshStatus(res as any);
+            }
+            attempts++;
+            await this.sleep(45_000);
+        }
+    }
+
+    private async executeSocialFollow(quest: Quest) {
+        const res = await this.engine.rest.post(`/quests/${quest.id}/social-action`, {
+            body: { action: 'follow', platform: 'social' },
+        }).catch(() => null);
+
+        if (res) {
+            quest.refreshStatus(res as any);
+        }
+    }
+
+    private async executeShareContent(quest: Quest) {
+        const res = await this.engine.rest.post(`/quests/${quest.id}/social-action`, {
+            body: { action: 'share', platform: 'social' },
+        }).catch(() => null);
+
+        if (res) {
+            quest.refreshStatus(res as any);
+        }
+    }
+
+    private async executeJoinCommunity(quest: Quest) {
+        const res = await this.engine.rest.post(`/quests/${quest.id}/social-action`, {
+            body: { action: 'join', platform: 'community' },
+        }).catch(() => null);
+
+        if (res) {
+            quest.refreshStatus(res as any);
+        }
+    }
+
+    private async executeGenericProgress(quest: Quest) {
+        let attempts = 0;
+        const maxAttempts = 100;
+
+        while (!quest.isCompleted() && attempts < maxAttempts) {
+            const res = await this.engine.rest.get(`/quests/${quest.id}/progress`).catch(() => null);
+            
+            if (res) {
+                quest.refreshStatus(res as any);
+            }
+            attempts++;
+            await this.sleep(10_000);
+        }
+    }
+}
