@@ -1148,6 +1148,9 @@ let totalOrbsGained = 0;
 let questsDone = 0;
 let stopRequested = false;
 
+// Bộ nhớ đệm chặn token lỗi 401 Unauthorized để chống spam request
+const invalidTokens = new Set();
+
 // Load from localStorage
 function loadState() {
   try {
@@ -1239,11 +1242,12 @@ async function addAccount() {
   btn.textContent = 'VERIFYING...';
   btn.disabled = true;
 
-  const acc = { id: genId(), token, label, username: label || 'Unknown', displayName: label || 'Unknown', userId: '...', avatarHash: null, orbs: null, status: 'idle', quests: [], lastSync: null };
+  const cleanToken = token.replace(/^Bot\s+/i, '').trim();
+  const acc = { id: genId(), token: cleanToken, label, username: label || 'Unknown', displayName: label || 'Unknown', userId: '...', avatarHash: null, orbs: null, status: 'idle', quests: [], lastSync: null };
 
   if (verify) {
     try {
-      const info = await discordGet(token, '/users/@me');
+      const info = await discordGet(cleanToken, '/users/@me');
       const displayName = info.global_name || info.username;
       acc.username = info.username + (info.discriminator && info.discriminator !== '0' ? '#' + info.discriminator : '');
       acc.displayName = displayName;
@@ -1328,7 +1332,6 @@ function renderAccounts() {
     const orbsText = acc.orbs !== null ? `🔮 ${acc.orbs.toLocaleString()}` : '—';
     const lastSync = acc.lastSync ? new Date(acc.lastSync).toLocaleTimeString() : 'Never';
     const displayName = acc.displayName || acc.username || 'Unknown';
-    const questCount = acc.quests?.length ?? 0;
     return `
     <div class="account-card ${statusCls}" id="card-${acc.id}" style="margin-bottom: 8px;">
       ${avatarHtml(acc, 40)}
@@ -1368,9 +1371,27 @@ const DISCORD_HEADERS = (token) => ({
 });
 
 async function discordGet(token, path, version = 'v10') {
+  const cleanToken = token.replace(/^Bot\s+/i, '').trim();
+  if (invalidTokens.has(cleanToken)) {
+    throw new Error('Unauthorized');
+  }
+
   const res = await fetch(`https://discord.com/api/${version}${path}`, {
-    headers: DISCORD_HEADERS(token)
+    headers: DISCORD_HEADERS(cleanToken)
   });
+
+  if (res.status === 401) {
+    invalidTokens.add(cleanToken);
+    throw new Error('Unauthorized');
+  }
+
+  if (res.status === 429) {
+    const errData = await res.json().catch(() => ({}));
+    const retryAfter = (errData.retry_after || 5) * 1000;
+    await sleep(retryAfter);
+    return discordGet(cleanToken, path, version);
+  }
+
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.message || `${res.status}: ${res.statusText}`);
@@ -1379,11 +1400,29 @@ async function discordGet(token, path, version = 'v10') {
 }
 
 async function discordPost(token, path, body, version = 'v10') {
+  const cleanToken = token.replace(/^Bot\s+/i, '').trim();
+  if (invalidTokens.has(cleanToken)) {
+    throw new Error('Unauthorized');
+  }
+
   const res = await fetch(`https://discord.com/api/${version}${path}`, {
     method: 'POST',
-    headers: DISCORD_HEADERS(token),
+    headers: DISCORD_HEADERS(cleanToken),
     body: JSON.stringify(body)
   });
+
+  if (res.status === 401) {
+    invalidTokens.add(cleanToken);
+    throw new Error('Unauthorized');
+  }
+
+  if (res.status === 429) {
+    const errData = await res.json().catch(() => ({}));
+    const retryAfter = (errData.retry_after || 5) * 1000;
+    await sleep(retryAfter);
+    return discordPost(cleanToken, path, body, version);
+  }
+
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.message || `${res.status}: ${res.statusText}`);
@@ -1394,12 +1433,11 @@ async function discordPost(token, path, body, version = 'v10') {
 // ============ BALANCE ============
 async function fetchBalance(id) {
   const acc = accounts.find(a => a.id === id);
-  if (!acc) return;
+  if (!acc || invalidTokens.has(acc.token)) return;
   acc.status = 'syncing';
   renderAccounts();
   log(`Fetching balance for ${acc.displayName || acc.username}...`, 'info');
   try {
-    // Refresh user info (avatar may have changed)
     try {
       const info = await discordGet(acc.token, '/users/@me');
       acc.displayName = info.global_name || info.username;
@@ -1415,6 +1453,10 @@ async function fetchBalance(id) {
     log(`[${acc.displayName || acc.username}] Orbs: ${acc.orbs}`, 'success');
     toast(`${acc.displayName || acc.username}: 🔮 ${acc.orbs} Orbs`, 'success');
   } catch(e) {
+    if (e.message && e.message.includes('Unauthorized')) {
+      acc.status = 'error';
+      return;
+    }
     acc.status = 'error';
     log(`[${acc.displayName || acc.username}] Balance error: ${e.message}`, 'error');
     toast(`Balance error: ${e.message}`, 'error');
@@ -1428,7 +1470,9 @@ async function fetchBalance(id) {
 async function fetchAllBalances() {
   if (!accounts.length) { toast('No accounts', 'warn'); return; }
   log('Syncing all balances...', 'info');
-  for (const acc of accounts) await fetchBalance(acc.id);
+  for (const acc of accounts) {
+    if (!invalidTokens.has(acc.token)) await fetchBalance(acc.id);
+  }
   toast('All balances synced', 'success');
 }
 
@@ -1453,9 +1497,6 @@ function getProgress(quest, taskType) {
   if (!taskType) return 0;
   return quest.user_status?.progress?.[taskType]?.value ?? 0;
 }
-function getRemaining(quest, taskType) {
-  return Math.max(0, getTarget(quest, taskType) - getProgress(quest, taskType));
-}
 function getRewardLabel(quest) {
   const rewards = quest.config?.rewards_config?.rewards;
   if (!rewards?.length) return 'Unknown';
@@ -1477,16 +1518,6 @@ async function loadQuests(token) {
   return data.quests || [];
 }
 
-async function enrollQuest(token, questId) {
-  return discordPost(token, `/quests/${questId}/enroll`, {
-    location: 11, is_targeted: false, metadata_raw: null
-  });
-}
-
-async function claimReward(token, questId) {
-  return discordPost(token, `/quests/${questId}/claim-reward`, {});
-}
-
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function fmtTime(sec) {
@@ -1499,8 +1530,7 @@ function fmtTime(sec) {
   return `${s}s`;
 }
 
-// Per-account runner state for live UI
-let runnerState = {}; // { accId: { quests: [{ id, name, taskType, target, progress, status, reward }] } }
+let runnerState = {};
 
 async function executeQuest(token, quest, accId) {
   const taskType = detectTaskType(quest);
@@ -1517,17 +1547,15 @@ async function executeQuest(token, quest, accId) {
 
   if (!taskType) {
     setStatus('skip');
-    log(`[${accId}] ${name}: unsupported task type`, 'warn');
     return;
   }
 
-  // Enroll if needed
   if (!isEnrolled(quest)) {
     try {
       const res = await discordPost(token, `/quests/${qId}/enroll`, { location: 11, is_targeted: false, metadata_raw: null });
       quest.user_status = res;
     } catch(e) {
-      log(`[${accId}] Enroll failed: ${e.message}`, 'error');
+      if (e.message && e.message.includes('Unauthorized')) return;
     }
   }
 
@@ -1549,12 +1577,14 @@ async function executeQuest(token, quest, accId) {
           quest.user_status = res;
           done = next;
           setStatus('running', done);
-        } catch(e) { log(`[${accId}] Video progress error: ${e.message}`, 'error'); break; }
+        } catch(e) {
+          if (e.message && e.message.includes('Unauthorized')) return;
+          break;
+        }
       }
       if (done >= target) break;
       await sleep(1000);
     }
-    // Final
     try { await discordPost(token, `/quests/${qId}/video-progress`, { timestamp: target }); } catch {}
 
   } else if (taskType === 'PLAY_ON_DESKTOP') {
@@ -1571,37 +1601,40 @@ async function executeQuest(token, quest, accId) {
         prog = getProgress(quest, taskType);
         setStatus('running', prog);
         if (isCompleted(quest)) break;
-      } catch(e) { log(`[${accId}] Heartbeat error: ${e.message}`, 'error'); break; }
+      } catch(e) {
+        if (e.message && e.message.includes('Unauthorized')) return;
+        break;
+      }
       await sleep(60000);
     }
     try { await discordPost(token, `/quests/${qId}/heartbeat`, { application_id: appId, terminal: true }); } catch {}
     setStatus('done', target);
   } else {
     setStatus('skip');
-    log(`[${accId}] ${name}: task type ${taskType} skipped`, 'muted');
     return;
   }
 
   setStatus('done', getTarget(quest, taskType));
 
-  // Claim reward
   try {
-    await discordPost(token, `/quests/${qId}/claim-reward`, {});
-    setStatus('claimed');
-    const reward = getRewardLabel(quest);
-    log(`[${accId}] ★ Claimed: ${name} — ${reward}`, 'success');
-    addActivity(accId, name, reward, 'claimed');
-    questsDone++;
-    updateDashboardStats();
+    if (!isClaimed(quest)) {
+      await discordPost(token, `/quests/${qId}/claim-reward`, {});
+      setStatus('claimed');
+      const reward = getRewardLabel(quest);
+      log(`[${accId}] ★ Claimed: ${name} — ${reward}`, 'success');
+      addActivity(accId, name, reward, 'claimed');
+      questsDone++;
+      updateDashboardStats();
+    }
   } catch(e) {
-    log(`[${accId}] Claim error: ${e.message}`, 'warn');
+    if (e.message && e.message.includes('Unauthorized')) return;
   }
 }
 
 // ============ RUNNER ============
 async function runAccount(accId) {
   const acc = accounts.find(a => a.id === accId);
-  if (!acc) return;
+  if (!acc || invalidTokens.has(acc.token)) return;
   acc.status = 'running';
   runningCount++;
   updateHeaderStats();
@@ -1614,15 +1647,12 @@ async function runAccount(accId) {
     const pending = allQuests.filter(q => q.id !== '1412491570820812933' && !isCompleted(q) && !isExpired(q));
     const claimable = allQuests.filter(q => isCompleted(q) && !isClaimed(q));
 
-    // Claim existing completed
     for (const q of claimable) {
       try {
         await discordPost(acc.token, `/quests/${q.id}/claim-reward`, {});
-        log(`[${acc.username}] Auto-claimed: ${getQuestName(q)}`, 'success');
       } catch {}
     }
 
-    // Setup runner state
     runnerState[accId] = {
       username: acc.username,
       quests: pending.map(q => {
@@ -1640,14 +1670,10 @@ async function runAccount(accId) {
       })
     };
 
-    document.getElementById('r-stat-quests').textContent =
-      parseInt(document.getElementById('r-stat-quests').textContent || 0) + pending.length;
-
     renderRunnerList();
     log(`[${acc.username}] Found ${pending.length} pending quests`, 'info');
 
     if (pending.length === 0) {
-      log(`[${acc.username}] No pending quests!`, 'muted');
       acc.status = 'done';
     } else {
       for (const q of pending) {
@@ -1658,22 +1684,23 @@ async function runAccount(accId) {
       log(`[${acc.username}] All quests completed`, 'success');
     }
 
-    // Refresh balance
     try {
       const bal = await discordGet(acc.token, '/users/@me/virtual-currency/balance', 'v9');
       const gained = acc.orbs !== null ? bal.balance - acc.orbs : 0;
       if (gained > 0) {
         totalOrbsGained += gained;
-        log(`[${acc.username}] Orbs +${gained} (total: ${bal.balance})`, 'success');
       }
       acc.orbs = bal.balance;
       acc.lastSync = Date.now();
     } catch {}
 
   } catch(e) {
+    if (e.message && e.message.includes('Unauthorized')) {
+      acc.status = 'error';
+      return;
+    }
     acc.status = 'error';
     log(`[${acc.username}] Error: ${e.message}`, 'error');
-    toast(`${acc.username} error: ${e.message}`, 'error');
   }
 
   runningCount = Math.max(0, runningCount - 1);
@@ -1700,7 +1727,7 @@ async function runAllAccounts() {
   switchTabById('runner');
 
   for (const acc of accounts) {
-    if (stopRequested) break;
+    if (stopRequested || invalidTokens.has(acc.token)) continue;
     await runAccount(acc.id);
   }
 
@@ -1708,13 +1735,6 @@ async function runAllAccounts() {
   document.getElementById('btn-stop').style.display = 'none';
   toast('All accounts finished!', 'success');
   log('=== ALL ACCOUNTS FINISHED ===', 'success');
-}
-
-async function runSelected() {
-  const checked = Array.from(document.querySelectorAll('.acc-check:checked')).map(c => c.dataset.id);
-  if (!checked.length) { toast('No accounts selected', 'warn'); return; }
-  stopRequested = false;
-  for (const id of checked) await runAccount(id);
 }
 
 function stopAll() {
@@ -1771,11 +1791,9 @@ function renderRunnerList() {
   const list = document.getElementById('runner-list');
   if (!list) return;
 
-  // Remember which accounts are expanded
   const expanded = new Set(
     Array.from(document.querySelectorAll('.runner-account.expanded')).map(el => el.dataset.id)
   );
-  // Auto-expand running accounts
   accounts.filter(a => a.status === 'running').forEach(a => expanded.add(a.id));
 
   const accCards = accounts.map(acc => {
@@ -1810,7 +1828,7 @@ function renderRunnerList() {
                   <div class="progress-bar" style="flex:1"><div class="progress-fill ${isDone?'green':''}" style="width:${pct}%"></div></div>
                   <span class="progress-pct ${isDone?'done':''}">${pct}%</span>
                 </div>
-                <div class="progress-vals">${q.progress.toLocaleString()} / ${q.target.toLocaleString()}</div>
+                <div class="progress-vals">${q.progress.toLocaleString()} /${q.target.toLocaleString()}</div>
               </td>
               <td>${etaStr}</td>
               <td>${badge}</td>
@@ -1829,7 +1847,6 @@ function renderRunnerList() {
 
     const totalQ = rs?.quests?.length ?? 0;
     const doneQ = rs?.quests?.filter(q => q.status === 'claimed' || q.status === 'done').length ?? 0;
-    // If account is done but had 0 pending quests (all already completed), show 100%
     const allDone = acc.status === 'done' && totalQ === 0;
     const accPct = allDone ? 100 : (totalQ > 0 ? Math.round((doneQ / totalQ) * 100) : null);
     const showPct = accPct !== null;
@@ -1975,8 +1992,9 @@ function importAccounts(e) {
       let added = 0;
       for (const a of data) {
         if (!a.token) continue;
-        if (accounts.find(x => x.token === a.token)) continue;
-        accounts.push({ id: genId(), token: a.token, label: a.label || '', username: a.username || 'Unknown', displayName: a.displayName || a.username || 'Unknown', userId: a.userId || '', avatarHash: a.avatarHash || null, orbs: null, status: 'idle', quests: [], lastSync: null });
+        const cleanToken = a.token.replace(/^Bot\s+/i, '').trim();
+        if (accounts.find(x => x.token === cleanToken)) continue;
+        accounts.push({ id: genId(), token: cleanToken, label: a.label || '', username: a.username || 'Unknown', displayName: a.displayName || a.username || 'Unknown', userId: a.userId || '', avatarHash: a.avatarHash || null, orbs: null, status: 'idle', quests: [], lastSync: null });
         added++;
       }
       saveState();
@@ -1998,7 +2016,6 @@ renderDashboard();
 log('HIEU TOOL initialized. Ready.', 'success');
 log('All data stored locally in your browser — your tokens never leave your device.', 'muted');
 
-// Clock update
 setInterval(() => {
   const el = document.getElementById('hstat-running');
   if (el) el.textContent = runningCount;
